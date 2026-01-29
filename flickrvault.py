@@ -12,6 +12,7 @@ import json
 import os
 import re
 import sys
+import time
 import webbrowser
 import tempfile
 import http.server
@@ -26,6 +27,38 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import flickr_api
 from flickr_api.api import flickr
+
+
+# ============== RETRY HELPER ==============
+
+def retry_on_error(func, max_retries=3, base_delay=2, exceptions=(Exception,)):
+    """Retry a function with exponential backoff.
+
+    Args:
+        func: Callable to execute
+        max_retries: Maximum number of retry attempts
+        base_delay: Base delay in seconds (doubles each retry)
+        exceptions: Tuple of exceptions to catch and retry
+
+    Returns:
+        Result of func() if successful
+
+    Raises:
+        Last exception if all retries failed
+    """
+    last_error = None
+    for attempt in range(max_retries + 1):
+        try:
+            return func()
+        except exceptions as e:
+            last_error = e
+            if attempt < max_retries:
+                delay = base_delay * (2 ** attempt)
+                error_type = type(e).__name__
+                log_debug(f"    ⚠️  {error_type}, retrying in {delay}s... ({attempt + 1}/{max_retries})")
+                time.sleep(delay)
+            else:
+                raise last_error
 
 # ============== CONFIG ==============
 
@@ -192,14 +225,18 @@ STATUS = StatusLine()
 
 # ============== HELPERS ==============
 
-def flickr_call(method, **kwargs):
-    """Call Flickr API and return parsed JSON."""
+def flickr_call(method, retries=3, **kwargs):
+    """Call Flickr API and return parsed JSON with retry."""
     kwargs['format'] = 'json'
     kwargs['nojsoncallback'] = 1
-    result = method(**kwargs)
-    if isinstance(result, bytes):
-        result = json.loads(result.decode('utf-8'))
-    return result
+
+    def _call():
+        result = method(**kwargs)
+        if isinstance(result, bytes):
+            return json.loads(result.decode('utf-8'))
+        return result
+
+    return retry_on_error(_call, max_retries=retries)
 
 
 # ============== AUTH ==============
@@ -490,31 +527,35 @@ def fetch_all_photos_metadata(user_nsid: str, progress_callback=None, limit: int
 
 def fetch_all_albums(user, progress_callback=None) -> list:
     """Fetch all albums with metadata."""
-    photosets = list(user.getPhotosets())
+    photosets = list(retry_on_error(lambda: user.getPhotosets()))
     total = len(photosets)
     albums = []
     for i, ps in enumerate(photosets, 1):
         if progress_callback:
             progress_callback(f"  [{i}/{total}] Fetching album info...")
-        info = ps.getInfo()
-        albums.append({
-            'id': ps.id,
-            'title': info.get('title', ''),
-            'description': info.get('description', ''),
-            'photo_count': int(info.get('photos', 0)),
-            'video_count': int(info.get('videos', 0)),
-            'primary_photo_id': info.get('primary', ''),
-            'date_create': info.get('date_create', ''),
-            'date_update': info.get('date_update', ''),
-        })
+        try:
+            info = retry_on_error(lambda ps=ps: ps.getInfo())
+            albums.append({
+                'id': ps.id,
+                'title': info.get('title', ''),
+                'description': info.get('description', ''),
+                'photo_count': int(info.get('photos', 0)),
+                'video_count': int(info.get('videos', 0)),
+                'primary_photo_id': info.get('primary', ''),
+                'date_create': info.get('date_create', ''),
+                'date_update': info.get('date_update', ''),
+            })
+        except Exception as e:
+            log_error(f"  ⚠️  Failed to fetch album {ps.id}: {e}")
     return albums
 
 
 def fetch_album_photos(album_id: str, progress_callback=None) -> list:
-    """Fetch photo IDs in an album."""
+    """Fetch photo IDs in an album with retry."""
     ps = flickr_api.Photoset(id=album_id)
     photo_ids = []
-    for i, photo in enumerate(ps.getPhotos()):
+    photos = retry_on_error(lambda: list(ps.getPhotos()))
+    for i, photo in enumerate(photos):
         photo_ids.append({'photo_id': photo.id, 'position': i})
         if progress_callback and (i + 1) % 50 == 0:
             progress_callback(f"     {i + 1} photos...")
@@ -529,7 +570,7 @@ def fetch_photo_details(photo_id: str, verbose=False) -> dict:
         if verbose:
             print(f" info", end='', flush=True)
         photo = flickr_api.Photo(id=photo_id)
-        info = photo.getInfo()
+        info = retry_on_error(lambda: photo.getInfo())
         
         # Basic info
         details['title'] = info.get('title', '')
@@ -596,7 +637,7 @@ def fetch_photo_details(photo_id: str, verbose=False) -> dict:
         if verbose:
             print(f" exif", end='', flush=True)
         photo = flickr_api.Photo(id=photo_id)
-        exif_data = photo.getExif()
+        exif_data = retry_on_error(lambda: photo.getExif())
         exif = {}
         
         exif_map = {
@@ -622,7 +663,7 @@ def fetch_photo_details(photo_id: str, verbose=False) -> dict:
         if verbose:
             print(f" geo", end='', flush=True)
         photo = flickr_api.Photo(id=photo_id)
-        loc = photo.getLocation()
+        loc = retry_on_error(lambda: photo.getLocation())
         details['geo'] = {
             'latitude': float(loc.get('latitude', 0)),
             'longitude': float(loc.get('longitude', 0)),
@@ -680,12 +721,12 @@ def fetch_photo_details(photo_id: str, verbose=False) -> dict:
 
 
 def download_photo_file(photo_id: str, output_path: Path, size='Original', verbose=False) -> bool:
-    """Download original photo file."""
+    """Download original photo file with retry."""
     try:
         if verbose:
             print(f"    Getting sizes...", end='', flush=True)
         photo = flickr_api.Photo(id=photo_id)
-        sizes = photo.getSizes()
+        sizes = retry_on_error(lambda: photo.getSizes())
 
         # Try to get original, fall back to largest
         url = None
@@ -703,7 +744,7 @@ def download_photo_file(photo_id: str, output_path: Path, size='Original', verbo
         if url:
             if verbose:
                 print(f" downloading ({selected_size})...", end='', flush=True)
-            photo.save(str(output_path), size_label=size)
+            retry_on_error(lambda: photo.save(str(output_path), size_label=size))
             return True
         return False
     except Exception as e:
