@@ -2486,6 +2486,10 @@ def main():
                              help='Photo order: newest first (default) or oldest first')
     sync_parser.add_argument('--from-date', help='Start date (YYYY-MM-DD or YYYY)')
     sync_parser.add_argument('--to-date', help='End date (YYYY-MM-DD or YYYY)')
+    # Output control (also available as global options before command)
+    sync_parser.add_argument('-q', '--quiet', action='store_true', help='Quiet mode (errors only)')
+    sync_parser.add_argument('-v', '--verbose', action='store_true', help='Verbose mode')
+    sync_parser.add_argument('--progress', action='store_true', help='Show progress bar')
 
     # Download (specific album or by photo)
     dl_parser = subparsers.add_parser('download', help='Download album (by ID/URL or by photo)')
@@ -2638,12 +2642,16 @@ def main():
     if args.config:
         set_config_dir(args.config)
 
-    # Set output level
-    if args.quiet:
+    # Set output level (check both global and subcommand options)
+    quiet = getattr(args, 'quiet', False)
+    verbose = getattr(args, 'verbose', False)
+    progress = getattr(args, 'progress', False)
+
+    if quiet:
         set_output_level(OutputLevel.QUIET, progress=False)
-    elif args.verbose:
+    elif verbose:
         set_output_level(OutputLevel.VERBOSE, progress=False)
-    elif args.progress:
+    elif progress:
         set_output_level(OutputLevel.NORMAL, progress=True)
     else:
         set_output_level(OutputLevel.NORMAL, progress=False)
