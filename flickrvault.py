@@ -463,6 +463,9 @@ def fetch_all_photos_metadata(user_nsid: str, progress_callback=None, limit: int
     while True:
         if progress_callback:
             progress_callback(f"Fetching page {page}{'/' + str(total_pages) if total_pages else ''}...")
+        elif PROGRESS_MODE:
+            STATUS.update(phase='Phase 1', task='Fetching photo list...',
+                         progress=f"page {page}{'/' + str(total_pages) if total_pages else ''}")
 
         if use_search:
             # Use search API for date filtering
@@ -539,6 +542,8 @@ def fetch_all_albums(user, progress_callback=None) -> list:
     for i, ps in enumerate(photosets, 1):
         if progress_callback:
             progress_callback(f"  [{i}/{total}] Fetching album info...")
+        elif PROGRESS_MODE:
+            STATUS.update(phase='Phase 4', task='Fetching albums...', progress=f"{i}/{total}")
         try:
             info = retry_on_error(lambda ps=ps: ps.getInfo())
             albums.append({
@@ -842,8 +847,12 @@ def sync_backup(output_dir: Path, full: bool = False, download_photos: bool = Tr
     if PROGRESS_MODE:
         STATUS.update(phase='Phase 2', task='Checking for updates...', progress='')
     photos_to_update = []
-    
-    for p in all_photos:
+    total_photos = len(all_photos)
+
+    for i, p in enumerate(all_photos):
+        if PROGRESS_MODE and (i % 100 == 0 or i == total_photos - 1):
+            STATUS.update(phase='Phase 2', task='Checking for updates...',
+                         progress=f"{i + 1}/{total_photos}")
         photo_id = p['id']
         flickr_updated = p.get('lastupdate', '0')
         
