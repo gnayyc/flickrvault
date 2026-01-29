@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "flickr-api>=0.8.0",
+# ]
+# ///
 """
 flickrvault v2.0
 - Full metadata backup (EXIF, tags, geo, albums, people, stats)
