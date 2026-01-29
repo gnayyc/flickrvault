@@ -1369,8 +1369,15 @@ load('date');
 
 # ============== DOWNLOAD ALBUM ==============
 
-def extract_album_id(album_input: str) -> str:
-    """Extract album ID from URL or return as-is."""
+def extract_album_id(album_input: str, lookup_by_name: bool = True) -> str:
+    """Extract album ID from URL, name, or return as-is.
+
+    Supports:
+    - Album ID (numeric string)
+    - Flickr URL
+    - Album name (if lookup_by_name=True)
+    """
+    # Check if it's a URL
     if 'flickr.com' in album_input:
         parts = album_input.rstrip('/').split('/')
         for i, part in enumerate(parts):
@@ -1379,6 +1386,24 @@ def extract_album_id(album_input: str) -> str:
         for part in reversed(parts):
             if part.isdigit():
                 return part
+
+    # Check if it's already an ID (all digits)
+    if album_input.isdigit():
+        return album_input
+
+    # Try to look up by name
+    if lookup_by_name:
+        try:
+            user = get_user()
+            for ps in user.getPhotosets():
+                info = ps.getInfo()
+                if info.get('title', '') == album_input:
+                    print(f"📁 Found album: {album_input} → {ps.id}")
+                    return ps.id
+            print(f"⚠️  Album not found by name: {album_input}")
+        except Exception as e:
+            print(f"⚠️  Error looking up album: {e}")
+
     return album_input
 
 
@@ -1727,25 +1752,17 @@ def delete_albums_batch(pattern: str = None, empty: bool = False,
 
 
 def merge_albums(target_id: str, source_ids: list = None, pattern: str = None,
-                 delete_source: bool = False, confirm: bool = True):
+                 delete_source: bool = False, confirm: bool = True,
+                 create_target: bool = False):
     """Merge albums into one target album."""
-    target_id = extract_album_id(target_id)
+    target_ps = None
+    target_name = target_id  # Save original name for creating
 
-    try:
-        target_ps = flickr_api.Photoset(id=target_id)
-        target_info = target_ps.getInfo()
-        print(f"📁 Target album: {target_info.get('title', target_id)}")
-    except Exception as e:
-        print(f"❌ Target album not found: {e}")
-        return
-
-    # Find source albums
+    # First, find source albums (we need them to potentially create target)
     sources = []
     if source_ids:
         for sid in source_ids:
             sid = extract_album_id(sid)
-            if sid == target_id:
-                continue
             try:
                 ps = flickr_api.Photoset(id=sid)
                 info = ps.getInfo()
@@ -1761,9 +1778,8 @@ def merge_albums(target_id: str, source_ids: list = None, pattern: str = None,
     if pattern:
         user = get_user()
         regex = re.compile(pattern)
+        print(f"Scanning albums for pattern: {pattern}")
         for ps in user.getPhotosets():
-            if ps.id == target_id:
-                continue
             info = ps.getInfo()
             title = info.get('title', '')
             if regex.search(title):
@@ -1773,6 +1789,51 @@ def merge_albums(target_id: str, source_ids: list = None, pattern: str = None,
                     'photo_count': int(info.get('photos', 0)),
                     'photoset': ps,
                 })
+
+    if not sources:
+        print("No source albums found.")
+        return
+
+    # Try to find or create target album
+    target_id_resolved = extract_album_id(target_id, lookup_by_name=True)
+
+    try:
+        target_ps = flickr_api.Photoset(id=target_id_resolved)
+        target_info = target_ps.getInfo()
+        print(f"📁 Target album: {target_info.get('title', target_id_resolved)}")
+        # Remove target from sources if it was included
+        sources = [s for s in sources if s['id'] != target_id_resolved]
+    except Exception as e:
+        if create_target:
+            # Create new album using first photo from first source
+            print(f"📁 Creating new album: {target_name}")
+            first_photo = None
+            for source in sources:
+                try:
+                    photos = list(source['photoset'].getPhotos())
+                    if photos:
+                        first_photo = photos[0]
+                        break
+                except:
+                    continue
+
+            if not first_photo:
+                print("❌ Cannot create album: no photos found in source albums")
+                return
+
+            try:
+                target_ps = flickr_api.Photoset.create(
+                    title=target_name,
+                    primary_photo=first_photo
+                )
+                print(f"   ✓ Created album: {target_ps.id}")
+            except Exception as ce:
+                print(f"❌ Failed to create album: {ce}")
+                return
+        else:
+            print(f"❌ Target album not found: {target_id}")
+            print(f"   Use --create to create a new album with this name")
+            return
 
     if not sources:
         print("No source albums found.")
@@ -2507,8 +2568,9 @@ def main():
     album_reorder.add_argument('--by', choices=['date', 'date_desc', 'title'], default='date')
 
     album_merge = album_sub.add_parser('merge', help='Merge albums into one')
-    album_merge.add_argument('--into', required=True, help='Target album ID')
-    album_merge.add_argument('--from', dest='from_albums', nargs='+', help='Source album IDs')
+    album_merge.add_argument('--into', required=True, help='Target album ID or name')
+    album_merge.add_argument('--create', action='store_true', help='Create target album if not exists (uses --into as name)')
+    album_merge.add_argument('--from', dest='from_albums', nargs='+', help='Source album IDs or names')
     album_merge.add_argument('--pattern', '-p', help='Merge albums matching regex pattern')
     album_merge.add_argument('--delete-source', action='store_true', help='Delete source albums after merge')
     album_merge.add_argument('-y', '--yes', action='store_true', help='Skip confirmation')
@@ -2691,7 +2753,8 @@ def main():
                 source_ids=args.from_albums,
                 pattern=args.pattern,
                 delete_source=args.delete_source,
-                confirm=not args.yes
+                confirm=not args.yes,
+                create_target=args.create
             )
         else:
             print("Usage: flickr album {create|delete|reorder|merge}")
