@@ -55,12 +55,15 @@ def check_rate_limit():
             time.sleep(wait_time)
 
 
-def set_rate_limit(seconds=60):
+def set_rate_limit(seconds=120):
     """Set rate limit pause for all threads."""
     global _rate_limit_until
     with _rate_limit_lock:
-        _rate_limit_until = time.time() + seconds
-        print(f"\n⚠️  Rate limit detected! Pausing {seconds}s...", flush=True)
+        new_until = time.time() + seconds
+        # Only extend if this is longer than current wait
+        if new_until > _rate_limit_until:
+            _rate_limit_until = new_until
+            print(f"\n⚠️  Rate limit detected! Pausing {seconds}s...", flush=True)
 
 
 def is_rate_limit_error(error):
@@ -85,7 +88,10 @@ def retry_on_error(func, max_retries=3, base_delay=2, exceptions=(Exception,)):
         Last exception if all retries failed
     """
     last_error = None
-    for attempt in range(max_retries + 1):
+    rate_limit_retries = 0
+    max_rate_limit_retries = 5  # Extra retries for rate limit
+
+    for attempt in range(max_retries + 1 + max_rate_limit_retries):
         try:
             # Check if we're rate limited before making request
             check_rate_limit()
@@ -96,9 +102,13 @@ def retry_on_error(func, max_retries=3, base_delay=2, exceptions=(Exception,)):
             last_error = e
             # Check for rate limit error
             if is_rate_limit_error(e):
-                set_rate_limit(60)  # Wait 60 seconds on rate limit
-                if attempt < max_retries:
+                rate_limit_retries += 1
+                if rate_limit_retries <= max_rate_limit_retries:
+                    set_rate_limit(120)  # Wait 120 seconds on rate limit
+                    check_rate_limit()  # Actually wait
                     continue  # Retry after rate limit wait
+                else:
+                    raise last_error  # Too many rate limits
             elif attempt < max_retries:
                 delay = base_delay * (2 ** attempt)
                 error_type = type(e).__name__
@@ -339,6 +349,11 @@ STATUS = StatusLine()
 
 # ============== HELPERS ==============
 
+class RateLimitError(Exception):
+    """Raised when Flickr API returns 429 Too Many Requests."""
+    pass
+
+
 def flickr_call(method, retries=3, **kwargs):
     """Call Flickr API and return parsed JSON with retry."""
     kwargs['format'] = 'json'
@@ -347,7 +362,20 @@ def flickr_call(method, retries=3, **kwargs):
     def _call():
         result = method(**kwargs)
         if isinstance(result, bytes):
-            return json.loads(result.decode('utf-8'))
+            text = result.decode('utf-8')
+            # Check for rate limit HTML response
+            if '429' in text or 'Too Many Requests' in text:
+                raise RateLimitError("429 Too Many Requests")
+            # Check for empty or HTML response
+            if not text or text.startswith('<!DOCTYPE') or text.startswith('<html'):
+                raise RateLimitError(f"Invalid response (possibly rate limited): {text[:100]}")
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError as e:
+                # If JSON parsing fails, might be rate limit or error page
+                if '429' in text or 'Too Many' in text:
+                    raise RateLimitError("429 Too Many Requests")
+                raise
         return result
 
     return retry_on_error(_call, max_retries=retries)
