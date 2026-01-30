@@ -395,24 +395,32 @@ def flickr_call(method, retries=3, **kwargs):
             if os.environ.get('FLICKR_DEBUG'):
                 print(f"[DEBUG] Response type: bytes, length: {len(text)}")
                 print(f"[DEBUG] Response preview: {text[:300]}")
-            # Check for rate limit (429) specifically
-            if '429' in text or 'Too Many Requests' in text:
-                raise RateLimitError(f"429 Too Many Requests: {text[:200]}")
             # Check for empty response
             if not text:
                 raise Exception("Empty response from Flickr API")
-            # Check for HTML error page (not rate limit)
+            # Check for HTML error page (not JSON)
             if text.startswith('<!DOCTYPE') or text.startswith('<html'):
-                # Extract error info if possible
+                # Only treat as rate limit if it explicitly says 429 in HTML context
+                if 'HTTP 429' in text or '>429<' in text or 'Too Many Requests' in text:
+                    raise RateLimitError("429 Too Many Requests (HTML response)")
                 preview = text[:300].replace('\n', ' ')
                 raise Exception(f"HTML error response (check API key/auth): {preview}")
+            # Try to parse JSON first
             try:
-                return json.loads(text)
-            except json.JSONDecodeError as e:
-                # If JSON parsing fails, check if it's rate limit
-                if '429' in text or 'Too Many' in text:
-                    raise RateLimitError(f"429 Too Many Requests: {text[:200]}")
-                raise Exception(f"Invalid JSON response: {text[:200]}")
+                data = json.loads(text)
+                # Check for API error response
+                if data.get('stat') == 'fail':
+                    code = data.get('code', 0)
+                    msg = data.get('message', 'Unknown error')
+                    if code == 429 or 'Too Many' in str(msg):
+                        raise RateLimitError(f"429 Too Many Requests: {msg}")
+                    raise Exception(f"Flickr API error {code}: {msg}")
+                return data
+            except json.JSONDecodeError:
+                # Non-JSON, non-HTML response - might be rate limit page
+                if 'Too Many Requests' in text:
+                    raise RateLimitError("429 Too Many Requests")
+                raise Exception(f"Invalid response: {text[:200]}")
         return result
 
     return retry_on_error(_call, max_retries=retries)
