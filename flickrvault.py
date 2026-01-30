@@ -388,23 +388,27 @@ def flickr_call(method, retries=3, **kwargs):
         result = method(**kwargs)
         if isinstance(result, bytes):
             text = result.decode('utf-8')
+            # Debug: show first request response
+            if os.environ.get('FLICKR_DEBUG'):
+                print(f"[DEBUG] Response type: bytes, length: {len(text)}")
+                print(f"[DEBUG] Response preview: {text[:300]}")
             # Check for rate limit (429) specifically
             if '429' in text or 'Too Many Requests' in text:
-                raise RateLimitError("429 Too Many Requests")
+                raise RateLimitError(f"429 Too Many Requests: {text[:200]}")
             # Check for empty response
             if not text:
                 raise Exception("Empty response from Flickr API")
             # Check for HTML error page (not rate limit)
             if text.startswith('<!DOCTYPE') or text.startswith('<html'):
                 # Extract error info if possible
-                preview = text[:200].replace('\n', ' ')
+                preview = text[:300].replace('\n', ' ')
                 raise Exception(f"HTML error response (check API key/auth): {preview}")
             try:
                 return json.loads(text)
             except json.JSONDecodeError as e:
                 # If JSON parsing fails, check if it's rate limit
                 if '429' in text or 'Too Many' in text:
-                    raise RateLimitError("429 Too Many Requests")
+                    raise RateLimitError(f"429 Too Many Requests: {text[:200]}")
                 raise Exception(f"Invalid JSON response: {text[:200]}")
         return result
 
