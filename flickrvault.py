@@ -132,15 +132,18 @@ def log_error(msg: str):
 
 
 class ProgressBar:
-    """Simple progress bar for terminal."""
+    """Simple progress bar for terminal with speed and ETA."""
 
-    def __init__(self, total: int, desc: str = '', width: int = 40):
+    def __init__(self, total: int, desc: str = '', width: int = 30):
         self.total = total
         self.current = 0
         self.desc = desc
         self.width = width
         self.status = ''
         self._last_line_len = 0
+        self._start_time = time.time()
+        self._last_update_time = self._start_time
+        self._last_count = 0
 
     def update(self, n: int = 1, status: str = None):
         """Update progress by n steps."""
@@ -156,20 +159,53 @@ class ProgressBar:
             self.status = status
         self._render()
 
+    def _format_time(self, seconds: float) -> str:
+        """Format seconds as HH:MM:SS or MM:SS."""
+        if seconds < 0 or seconds > 86400 * 7:  # Cap at 7 days
+            return "--:--"
+        hours, remainder = divmod(int(seconds), 3600)
+        minutes, secs = divmod(remainder, 60)
+        if hours > 0:
+            return f"{hours}:{minutes:02d}:{secs:02d}"
+        return f"{minutes}:{secs:02d}"
+
     def _render(self):
         """Render progress bar."""
         if not PROGRESS_MODE:
             return
 
+        now = time.time()
+        elapsed = now - self._start_time
         pct = self.current / self.total if self.total > 0 else 0
         filled = int(self.width * pct)
         bar = '█' * filled + '░' * (self.width - filled)
 
+        # Calculate speed (items per minute)
+        speed_str = ""
+        eta_str = ""
+        if elapsed > 2 and self.current > 0:
+            speed = self.current / elapsed * 60  # per minute
+            speed_str = f"{speed:.1f}/min"
+
+            # ETA
+            remaining = self.total - self.current
+            if speed > 0:
+                eta_seconds = remaining / (speed / 60)
+                eta_str = f"ETA {self._format_time(eta_seconds)}"
+
         # Truncate status if too long
-        max_status_len = 30
+        max_status_len = 20
         status = self.status[:max_status_len] if len(self.status) > max_status_len else self.status
 
-        line = f"\r{self.desc}: [{bar}] {self.current}/{self.total} {status}"
+        # Build line: Phase 3: [████░░░░] 100/1000 | 5.2/min | ETA 12:34 | status
+        parts = [f"\r{self.desc}: [{bar}] {self.current}/{self.total}"]
+        if speed_str:
+            parts.append(speed_str)
+        if eta_str:
+            parts.append(eta_str)
+        if status:
+            parts.append(status)
+        line = " | ".join(parts)
 
         # Clear previous line if it was longer
         if len(line) < self._last_line_len:
@@ -181,8 +217,12 @@ class ProgressBar:
     def finish(self, msg: str = None):
         """Finish progress bar."""
         if PROGRESS_MODE:
+            elapsed = time.time() - self._start_time
+            elapsed_str = self._format_time(elapsed)
             if msg:
-                self.status = msg
+                self.status = f"{msg} ({elapsed_str})"
+            else:
+                self.status = f"Done ({elapsed_str})"
             self._render()
             print()  # New line
 
