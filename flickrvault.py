@@ -640,6 +640,17 @@ def get_cached_photo_count(conn) -> int:
     return row[0] if row else 0
 
 
+def get_flickr_photo_count(user_nsid: str) -> int:
+    """Get total photo count from Flickr (single API call)."""
+    result = flickr_call(
+        flickr.people.getPhotos,
+        user_id=user_nsid,
+        per_page=1,  # Only need count, not actual photos
+        page=1
+    )
+    return int(result['photos']['total'])
+
+
 def fetch_all_photos_metadata(user_nsid: str, progress_callback=None, limit: int = None,
                                order: str = 'newest', from_date: str = None,
                                to_date: str = None) -> list:
@@ -1041,28 +1052,43 @@ def sync_backup(output_dir: Path, full: bool = False, download_photos: bool = Tr
     }
     (output_dir / 'account.json').write_text(json.dumps(account_info, indent=2))
     
-    # Start sync log
-    sync_started = datetime.now().isoformat()
-    cursor = conn.cursor()
-    cursor.execute('''
-        INSERT INTO sync_log (sync_type, started_at, photos_scanned, photos_downloaded, photos_updated, errors)
-        VALUES (?, ?, 0, 0, 0, 0)
-    ''', ('full' if full else 'incremental', sync_started))
-    sync_id = cursor.lastrowid
-    conn.commit()
-    
     stats = {'scanned': 0, 'downloaded': 0, 'updated': 0, 'skipped': 0, 'errors': 0}
+    cursor = conn.cursor()
 
     # Check for incremental sync
     cached_count = get_cached_photo_count(conn)
     last_sync_ts = get_last_sync_timestamp(conn)
-    use_incremental = not full and cached_count > 0 and last_sync_ts > 0 and not from_date and not to_date
+
+    # Auto-detect incomplete sync by comparing local count vs Flickr total
+    flickr_total = 0
+    auto_full = False
+    if not full and cached_count > 0 and last_sync_ts > 0 and not from_date and not to_date:
+        log_info("🔍 Checking Flickr photo count...")
+        flickr_total = get_flickr_photo_count(user_nsid)
+        if cached_count < flickr_total:
+            auto_full = True
+            log_info(f"   ⚠️  Incomplete sync detected: {cached_count} local < {flickr_total} on Flickr")
+            log_info(f"   → Switching to full mode to catch missing photos")
+
+    use_incremental = not full and not auto_full and cached_count > 0 and last_sync_ts > 0 and not from_date and not to_date
+
+    # Start sync log (after auto-detection)
+    sync_started = datetime.now().isoformat()
+    sync_type = 'incremental' if use_incremental else ('auto-full' if auto_full else 'full')
+    cursor.execute('''
+        INSERT INTO sync_log (sync_type, started_at, photos_scanned, photos_downloaded, photos_updated, errors)
+        VALUES (?, ?, 0, 0, 0, 0)
+    ''', (sync_type, sync_started))
+    sync_id = cursor.lastrowid
+    conn.commit()
 
     # Print sync mode banner
     if PROGRESS_MODE:
         if use_incremental:
             last_sync_time = datetime.fromtimestamp(last_sync_ts).strftime('%Y-%m-%d %H:%M')
             print(f"🔄 Incremental sync (cache: {cached_count} photos, last: {last_sync_time})")
+        elif auto_full:
+            print(f"📥 Full sync (auto: {cached_count}/{flickr_total} photos cached)")
         else:
             mode = "full" if full else "initial"
             print(f"📥 Full sync ({mode})")
