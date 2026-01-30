@@ -144,6 +144,11 @@ class ProgressBar:
         self._start_time = time.time()
         self._last_update_time = self._start_time
         self._last_count = 0
+        self._bytes_total = 0  # Track total bytes downloaded
+
+    def add_bytes(self, bytes_count: int):
+        """Add downloaded bytes for speed calculation."""
+        self._bytes_total += bytes_count
 
     def update(self, n: int = 1, status: str = None):
         """Update progress by n steps."""
@@ -169,6 +174,17 @@ class ProgressBar:
             return f"{hours}:{minutes:02d}:{secs:02d}"
         return f"{minutes}:{secs:02d}"
 
+    def _format_bytes(self, bytes_count: int) -> str:
+        """Format bytes as human readable."""
+        if bytes_count < 1024:
+            return f"{bytes_count}B"
+        elif bytes_count < 1024 * 1024:
+            return f"{bytes_count / 1024:.1f}KB"
+        elif bytes_count < 1024 * 1024 * 1024:
+            return f"{bytes_count / 1024 / 1024:.1f}MB"
+        else:
+            return f"{bytes_count / 1024 / 1024 / 1024:.2f}GB"
+
     def _render(self):
         """Render progress bar."""
         if not PROGRESS_MODE:
@@ -183,6 +199,7 @@ class ProgressBar:
         # Calculate speed (items per minute)
         speed_str = ""
         eta_str = ""
+        net_speed_str = ""
         if elapsed > 2 and self.current > 0:
             speed = self.current / elapsed * 60  # per minute
             speed_str = f"{speed:.1f}/min"
@@ -193,14 +210,24 @@ class ProgressBar:
                 eta_seconds = remaining / (speed / 60)
                 eta_str = f"ETA {self._format_time(eta_seconds)}"
 
+            # Network speed (MB/s)
+            if self._bytes_total > 0:
+                net_speed = self._bytes_total / elapsed  # bytes per second
+                if net_speed >= 1024 * 1024:
+                    net_speed_str = f"{net_speed / 1024 / 1024:.1f}MB/s"
+                else:
+                    net_speed_str = f"{net_speed / 1024:.0f}KB/s"
+
         # Truncate status if too long
         max_status_len = 20
         status = self.status[:max_status_len] if len(self.status) > max_status_len else self.status
 
-        # Build line: Phase 3: [████░░░░] 100/1000 | 5.2/min | ETA 12:34 | status
+        # Build line: Phase 3: [████░░░░] 100/1000 | 5.2/min | 2.3MB/s | ETA 12:34 | status
         parts = [f"\r{self.desc}: [{bar}] {self.current}/{self.total}"]
         if speed_str:
             parts.append(speed_str)
+        if net_speed_str:
+            parts.append(net_speed_str)
         if eta_str:
             parts.append(eta_str)
         if status:
@@ -842,8 +869,12 @@ def fetch_photo_details(photo_id: str, verbose=False) -> dict:
     return details
 
 
-def download_photo_file(photo_id: str, output_path: Path, size='Original', verbose=False) -> bool:
-    """Download original photo file with retry."""
+def download_photo_file(photo_id: str, output_path: Path, size='Original', verbose=False) -> tuple:
+    """Download original photo file with retry.
+
+    Returns:
+        (success: bool, bytes_downloaded: int)
+    """
     try:
         if verbose:
             print(f"    Getting sizes...", end='', flush=True)
@@ -867,11 +898,13 @@ def download_photo_file(photo_id: str, output_path: Path, size='Original', verbo
             if verbose:
                 print(f" downloading ({selected_size})...", end='', flush=True)
             retry_on_error(lambda: photo.save(str(output_path), size_label=size))
-            return True
-        return False
+            # Get file size after download
+            file_size = output_path.stat().st_size if output_path.exists() else 0
+            return True, file_size
+        return False, 0
     except Exception as e:
         print(f"    ✗ Download error: {e}")
-        return False
+        return False, 0
 
 
 def get_photo_year_month(photo_data: dict) -> tuple:
@@ -1058,8 +1091,11 @@ def sync_backup(output_dir: Path, full: bool = False, download_photos: bool = Tr
 
                 # Download photo file
                 if download_photos:
-                    if download_photo_file(photo_id, photo_path, verbose=not PROGRESS_MODE):
+                    success, file_bytes = download_photo_file(photo_id, photo_path, verbose=not PROGRESS_MODE)
+                    if success:
                         stats['downloaded'] += 1
+                        if PROGRESS_MODE and file_bytes > 0:
+                            progress.add_bytes(file_bytes)
                         if not PROGRESS_MODE:
                             print(f" ✓")
                     else:
@@ -1113,7 +1149,9 @@ def sync_backup(output_dir: Path, full: bool = False, download_photos: bool = Tr
                 stats['errors'] += 1
 
         if PROGRESS_MODE:
-            progress.finish(msg=f"Done: {stats['downloaded']} downloaded, {stats['errors']} errors")
+            total_dl = progress._format_bytes(progress._bytes_total) if progress._bytes_total > 0 else ""
+            dl_info = f", {total_dl}" if total_dl else ""
+            progress.finish(msg=f"Done: {stats['downloaded']} downloaded{dl_info}, {stats['errors']} errors")
 
     # Phase 4: Sync albums
     if skip_albums:
