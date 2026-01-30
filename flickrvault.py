@@ -43,7 +43,7 @@ from flickr_api.api import flickr
 _rate_limit_lock = threading.Lock()
 _rate_limit_until = 0  # Unix timestamp when rate limit expires
 _rate_limit_consecutive = 0  # Track consecutive rate limits for exponential backoff
-_request_delay = 0.1   # Delay between requests (seconds)
+_request_delay = 1.0   # Delay between requests (seconds) - Flickr limit: 3600/hour
 
 
 def check_rate_limit():
