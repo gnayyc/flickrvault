@@ -1054,6 +1054,7 @@ def sync_backup(output_dir: Path, full: bool = False, download_photos: bool = Tr
     log_info(f"   Skipped: {stats['skipped']}")
 
     # Phase 3: Fetch details & download
+    interrupted = False
     if photos_to_update:
         log_info(f"\n📥 Phase 3: Downloading {len(photos_to_update)} photos...")
 
@@ -1065,114 +1066,132 @@ def sync_backup(output_dir: Path, full: bool = False, download_photos: bool = Tr
             desc = '[3/4] Download' if download_photos else '[3/4] Metadata'
             progress = ProgressBar(len(photos_to_update), desc=desc)
 
-        for i, (p, reason) in enumerate(photos_to_update, 1):
-            photo_id = p['id']
-            stats['scanned'] += 1
+        try:
+            for i, (p, reason) in enumerate(photos_to_update, 1):
+                photo_id = p['id']
+                stats['scanned'] += 1
 
-            try:
-                # Determine path
-                year, month = get_photo_year_month(p)
-                month_dir = photos_dir / str(year) / f"{year}-{month:02d}"
-                month_dir.mkdir(parents=True, exist_ok=True)
+                try:
+                    # Determine path
+                    year, month = get_photo_year_month(p)
+                    month_dir = photos_dir / str(year) / f"{year}-{month:02d}"
+                    month_dir.mkdir(parents=True, exist_ok=True)
 
-                fmt = p.get('originalformat', 'jpg') or 'jpg'
-                photo_path = month_dir / f"{photo_id}.{fmt}"
-                meta_path = month_dir / f"{photo_id}.json"
+                    fmt = p.get('originalformat', 'jpg') or 'jpg'
+                    photo_path = month_dir / f"{photo_id}.{fmt}"
+                    meta_path = month_dir / f"{photo_id}.json"
 
-                if PROGRESS_MODE:
-                    progress.set(i - 1, status=f"{photo_id} ({reason})")
-                else:
-                    print(f"[{i}/{len(photos_to_update)}] {photo_id} ({reason}):", end='', flush=True)
-
-                # Fetch detailed metadata
-                details = fetch_photo_details(photo_id, verbose=not PROGRESS_MODE)
-
-                # Add sizes from batch data
-                details['sizes'] = {}
-                for size_key in ['url_sq', 'url_q', 'url_t', 'url_s', 'url_m', 'url_z', 'url_l', 'url_o']:
-                    if p.get(size_key):
-                        details['sizes'][size_key] = p[size_key]
-
-                # Save metadata JSON
-                details['_backup'] = {
-                    'downloaded_at': datetime.now().isoformat(),
-                    'file_path': str(photo_path) if download_photos else None,
-                }
-                meta_path.write_text(json.dumps(details, indent=2, ensure_ascii=False), encoding='utf-8')
-
-                # Download photo file
-                if download_photos:
-                    success, file_bytes = download_photo_file(photo_id, photo_path, verbose=not PROGRESS_MODE)
-                    if success:
-                        stats['downloaded'] += 1
-                        if PROGRESS_MODE and file_bytes > 0:
-                            progress.add_bytes(file_bytes)
-                        if not PROGRESS_MODE:
-                            print(f" ✓")
+                    if PROGRESS_MODE:
+                        progress.set(i - 1, status=f"{photo_id} ({reason})")
                     else:
-                        stats['errors'] += 1
+                        print(f"[{i}/{len(photos_to_update)}] {photo_id} ({reason}):", end='', flush=True)
+
+                    # Fetch detailed metadata
+                    details = fetch_photo_details(photo_id, verbose=not PROGRESS_MODE)
+
+                    # Add sizes from batch data
+                    details['sizes'] = {}
+                    for size_key in ['url_sq', 'url_q', 'url_t', 'url_s', 'url_m', 'url_z', 'url_l', 'url_o']:
+                        if p.get(size_key):
+                            details['sizes'][size_key] = p[size_key]
+
+                    # Save metadata JSON
+                    details['_backup'] = {
+                        'downloaded_at': datetime.now().isoformat(),
+                        'file_path': str(photo_path) if download_photos else None,
+                    }
+                    meta_path.write_text(json.dumps(details, indent=2, ensure_ascii=False), encoding='utf-8')
+
+                    # Download photo file
+                    if download_photos:
+                        success, file_bytes = download_photo_file(photo_id, photo_path, verbose=not PROGRESS_MODE)
+                        if success:
+                            stats['downloaded'] += 1
+                            if PROGRESS_MODE and file_bytes > 0:
+                                progress.add_bytes(file_bytes)
+                            if not PROGRESS_MODE:
+                                print(f" ✓")
+                        else:
+                            stats['errors'] += 1
+                            if not PROGRESS_MODE:
+                                print(f" ✗ (file)")
+                    else:
+                        stats['updated'] += 1
                         if not PROGRESS_MODE:
-                            print(f" ✗ (file)")
-                else:
-                    stats['updated'] += 1
-                    if not PROGRESS_MODE:
-                        print(f" ✓ (meta)")
+                            print(f" ✓ (meta)")
 
-                # Update DB
-                cursor.execute('''
-                    INSERT OR REPLACE INTO photos 
-                    (id, title, description, taken_date, upload_date, last_update, 
-                     license, views, latitude, longitude, original_format, media,
-                     local_path, meta_path, downloaded_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (
-                    photo_id,
-                    details.get('title', ''),
-                    details.get('description', ''),
-                    details.get('taken', p.get('datetaken', '')),
-                    details.get('uploaded', p.get('dateupload', '')),
-                    p.get('lastupdate', ''),
-                    details.get('license', 0),
-                    details.get('views', 0),
-                    details.get('geo', {}).get('latitude') if details.get('geo') else None,
-                    details.get('geo', {}).get('longitude') if details.get('geo') else None,
-                    fmt,
-                    details.get('media', 'photo'),
-                    str(photo_path) if download_photos else None,
-                    str(meta_path),
-                    datetime.now().isoformat(),
-                ))
-                
-                # Save tags
-                for tag in details.get('tags', []):
+                    # Update DB
                     cursor.execute('''
-                        INSERT OR REPLACE INTO tags (photo_id, tag_id, tag_raw, tag_clean, author)
-                        VALUES (?, ?, ?, ?, ?)
-                    ''', (photo_id, tag.get('id', ''), tag.get('raw', ''), tag.get('clean', ''), tag.get('author', '')))
-                
-                conn.commit()
-                
-            except Exception as e:
-                if PROGRESS_MODE:
-                    progress.update(status=f"Error: {e}")
-                else:
-                    print(f" ✗ Error: {e}")
-                stats['errors'] += 1
+                        INSERT OR REPLACE INTO photos
+                        (id, title, description, taken_date, upload_date, last_update,
+                         license, views, latitude, longitude, original_format, media,
+                         local_path, meta_path, downloaded_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (
+                        photo_id,
+                        details.get('title', ''),
+                        details.get('description', ''),
+                        details.get('taken', p.get('datetaken', '')),
+                        details.get('uploaded', p.get('dateupload', '')),
+                        p.get('lastupdate', ''),
+                        details.get('license', 0),
+                        details.get('views', 0),
+                        details.get('geo', {}).get('latitude') if details.get('geo') else None,
+                        details.get('geo', {}).get('longitude') if details.get('geo') else None,
+                        fmt,
+                        details.get('media', 'photo'),
+                        str(photo_path) if download_photos else None,
+                        str(meta_path),
+                        datetime.now().isoformat(),
+                    ))
 
-        if PROGRESS_MODE:
+                    # Save tags
+                    for tag in details.get('tags', []):
+                        cursor.execute('''
+                            INSERT OR REPLACE INTO tags (photo_id, tag_id, tag_raw, tag_clean, author)
+                            VALUES (?, ?, ?, ?, ?)
+                        ''', (photo_id, tag.get('id', ''), tag.get('raw', ''), tag.get('clean', ''), tag.get('author', '')))
+
+                    conn.commit()
+
+                except Exception as e:
+                    if PROGRESS_MODE:
+                        progress.update(status=f"Error: {e}")
+                    else:
+                        print(f" ✗ Error: {e}")
+                    stats['errors'] += 1
+
+        except KeyboardInterrupt:
+            interrupted = True
+            conn.commit()  # Save progress
+            print()
+            print(f"\n⚠️  Interrupted! Progress saved.")
+            print(f"   Downloaded: {stats['downloaded']}, Errors: {stats['errors']}")
+            print(f"   Remaining: {len(photos_to_update) - i} photos")
+            print(f"   Run 'sync' again to continue.")
+
+        if PROGRESS_MODE and not interrupted:
             total_dl = progress._format_bytes(progress._bytes_total) if progress._bytes_total > 0 else ""
             dl_info = f", {total_dl}" if total_dl else ""
             progress.finish(msg=f"Done: {stats['downloaded']} downloaded{dl_info}, {stats['errors']} errors")
 
     # Phase 4: Sync albums
-    if skip_albums:
+    if interrupted:
+        log_info("\n📁 Phase 4: Skipped (interrupted)")
+        albums = []
+    elif skip_albums:
         log_info("\n📁 Phase 4: Skipped (--skip-albums)")
         albums = []
     else:
         log_info("\n📁 Phase 4: Syncing albums...")
         if PROGRESS_MODE:
             STATUS.update(phase='[4/4] Albums', task='Fetching album list from Flickr...', progress='')
-        albums = fetch_all_albums(user, progress_callback=log_info if not PROGRESS_MODE else None)
+        try:
+            albums = fetch_all_albums(user, progress_callback=log_info if not PROGRESS_MODE else None)
+        except KeyboardInterrupt:
+            interrupted = True
+            albums = []
+            print(f"\n⚠️  Interrupted during album fetch!")
         log_info(f"   Found {len(albums)} albums")
         if album_limit:
             albums = albums[:album_limit]
@@ -1187,49 +1206,59 @@ def sync_backup(output_dir: Path, full: bool = False, download_photos: bool = Tr
     if PROGRESS_MODE and albums:
         album_progress = ProgressBar(len(albums), desc='[4/4] Albums')
 
-    for i, album in enumerate(albums, 1):
-        if PROGRESS_MODE:
-            album_progress.set(i - 1, status=album['title'][:25])
-        else:
-            print(f"   [{i}/{len(albums)}] {album['title']} ({album['photo_count']} photos)...", end='', flush=True)
+    try:
+        for i, album in enumerate(albums, 1):
+            if PROGRESS_MODE:
+                album_progress.set(i - 1, status=album['title'][:25])
+            else:
+                print(f"   [{i}/{len(albums)}] {album['title']} ({album['photo_count']} photos)...", end='', flush=True)
 
-        # Save to DB
-        cursor.execute('''
-            INSERT OR REPLACE INTO albums
-            (id, title, description, photo_count, video_count, primary_photo_id, date_create, date_update)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            album['id'], album['title'], album['description'],
-            album['photo_count'], album['video_count'], album['primary_photo_id'],
-            album['date_create'], album['date_update']
-        ))
+            # Save to DB
+            cursor.execute('''
+                INSERT OR REPLACE INTO albums
+                (id, title, description, photo_count, video_count, primary_photo_id, date_create, date_update)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                album['id'], album['title'], album['description'],
+                album['photo_count'], album['video_count'], album['primary_photo_id'],
+                album['date_create'], album['date_update']
+            ))
 
-        # Fetch album photos
-        try:
-            album_photos = fetch_album_photos(album['id'])
-            for ap in album_photos:
-                cursor.execute('''
-                    INSERT OR REPLACE INTO album_photos (album_id, photo_id, position)
-                    VALUES (?, ?, ?)
-                ''', (album['id'], ap['photo_id'], ap['position']))
+            # Fetch album photos
+            try:
+                album_photos = fetch_album_photos(album['id'])
+                for ap in album_photos:
+                    cursor.execute('''
+                        INSERT OR REPLACE INTO album_photos (album_id, photo_id, position)
+                        VALUES (?, ?, ?)
+                    ''', (album['id'], ap['photo_id'], ap['position']))
 
-            # Save album JSON
-            album_data = {**album, 'photos': [ap['photo_id'] for ap in album_photos]}
-            album_file = albums_dir / f"{album['id']}.json"
-            album_file.write_text(json.dumps(album_data, indent=2, ensure_ascii=False), encoding='utf-8')
+                # Save album JSON
+                album_data = {**album, 'photos': [ap['photo_id'] for ap in album_photos]}
+                album_file = albums_dir / f"{album['id']}.json"
+                album_file.write_text(json.dumps(album_data, indent=2, ensure_ascii=False), encoding='utf-8')
 
-            albums_index.append({
-                'id': album['id'],
-                'title': album['title'],
-                'photo_count': album['photo_count'],
-            })
-            if not PROGRESS_MODE:
-                print(f" ✓")
-        except Exception as e:
-            if not PROGRESS_MODE:
-                print(f" ✗ {e}")
+                albums_index.append({
+                    'id': album['id'],
+                    'title': album['title'],
+                    'photo_count': album['photo_count'],
+                })
+                if not PROGRESS_MODE:
+                    print(f" ✓")
+            except Exception as e:
+                if not PROGRESS_MODE:
+                    print(f" ✗ {e}")
 
-    if PROGRESS_MODE and albums:
+            conn.commit()  # Commit after each album
+
+    except KeyboardInterrupt:
+        interrupted = True
+        conn.commit()
+        print()
+        print(f"\n⚠️  Interrupted! Album progress saved.")
+        print(f"   Synced: {len(albums_index)}/{len(albums)} albums")
+
+    if PROGRESS_MODE and albums and not interrupted:
         album_progress.finish(msg="Done")
 
     # Save albums index
@@ -1253,11 +1282,16 @@ def sync_backup(output_dir: Path, full: bool = False, download_photos: bool = Tr
     if PROGRESS_MODE:
         STATUS.clear()
     print(f"\n{'='*50}")
-    print(f"✅ Backup complete!")
+    if interrupted:
+        print(f"⚠️  Backup interrupted (progress saved)")
+    else:
+        print(f"✅ Backup complete!")
     print(f"   📷 Photos: {stats['downloaded']} downloaded, {stats['updated']} updated, {stats['skipped']} skipped")
-    print(f"   📁 Albums: {len(albums)}")
+    print(f"   📁 Albums: {len(albums_index)}")
     print(f"   ❌ Errors: {stats['errors']}")
     print(f"   📂 Location: {output_dir}")
+    if interrupted:
+        print(f"\n💡 Run 'sync' again to continue from where you left off.")
 
 
 # ============== LIST ==============
