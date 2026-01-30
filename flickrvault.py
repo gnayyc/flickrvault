@@ -125,6 +125,9 @@ def retry_on_error(func, max_retries=3, base_delay=2, exceptions=(Exception,)):
             return result
         except exceptions as e:
             last_error = e
+            # Debug: show what error triggered rate limit detection
+            if os.environ.get('FLICKR_DEBUG'):
+                print(f"[DEBUG] Exception: {type(e).__name__}: {e}")
             # Check for rate limit error
             if is_rate_limit_error(e):
                 rate_limit_retries += 1
