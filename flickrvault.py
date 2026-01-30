@@ -30,6 +30,7 @@ from datetime import datetime
 from urllib.parse import parse_qs, urlparse
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 import flickr_api
 from flickr_api.api import flickr
@@ -930,7 +931,7 @@ def get_photo_year_month(photo_data: dict) -> tuple:
 
 
 def sync_backup(output_dir: Path, full: bool = False, download_photos: bool = True,
-                max_workers: int = 4, limit: int = None, skip_albums: bool = False,
+                max_workers: int = 8, limit: int = None, skip_albums: bool = False,
                 album_limit: int = None, order: str = 'newest',
                 from_date: str = None, to_date: str = None):
     """Main sync function."""
@@ -1056,7 +1057,8 @@ def sync_backup(output_dir: Path, full: bool = False, download_photos: bool = Tr
     # Phase 3: Fetch details & download
     interrupted = False
     if photos_to_update:
-        log_info(f"\n📥 Phase 3: Downloading {len(photos_to_update)} photos...")
+        worker_count = max_workers if download_photos else min(max_workers, 4)
+        log_info(f"\n📥 Phase 3: Downloading {len(photos_to_update)} photos ({worker_count} workers)...")
 
         photos_dir = output_dir / 'photos'
         photos_dir.mkdir(exist_ok=True)
@@ -1066,61 +1068,56 @@ def sync_backup(output_dir: Path, full: bool = False, download_photos: bool = Tr
             desc = '[3/4] Download' if download_photos else '[3/4] Metadata'
             progress = ProgressBar(len(photos_to_update), desc=desc)
 
-        try:
-            for i, (p, reason) in enumerate(photos_to_update, 1):
-                photo_id = p['id']
-                stats['scanned'] += 1
+        # Thread-safe counters and lock
+        stats_lock = threading.Lock()
+        db_lock = threading.Lock()
+        completed_count = [0]  # Use list for mutable in closure
 
-                try:
-                    # Determine path
-                    year, month = get_photo_year_month(p)
-                    month_dir = photos_dir / str(year) / f"{year}-{month:02d}"
-                    month_dir.mkdir(parents=True, exist_ok=True)
+        def process_photo(task):
+            """Worker function to process a single photo."""
+            p, reason = task
+            photo_id = p['id']
+            result = {'downloaded': 0, 'updated': 0, 'errors': 0, 'bytes': 0}
 
-                    fmt = p.get('originalformat', 'jpg') or 'jpg'
-                    photo_path = month_dir / f"{photo_id}.{fmt}"
-                    meta_path = month_dir / f"{photo_id}.json"
+            try:
+                # Determine path
+                year, month = get_photo_year_month(p)
+                month_dir = photos_dir / str(year) / f"{year}-{month:02d}"
+                month_dir.mkdir(parents=True, exist_ok=True)
 
-                    if PROGRESS_MODE:
-                        progress.set(i - 1, status=f"{photo_id} ({reason})")
+                fmt = p.get('originalformat', 'jpg') or 'jpg'
+                photo_path = month_dir / f"{photo_id}.{fmt}"
+                meta_path = month_dir / f"{photo_id}.json"
+
+                # Fetch detailed metadata
+                details = fetch_photo_details(photo_id, verbose=False)
+
+                # Add sizes from batch data
+                details['sizes'] = {}
+                for size_key in ['url_sq', 'url_q', 'url_t', 'url_s', 'url_m', 'url_z', 'url_l', 'url_o']:
+                    if p.get(size_key):
+                        details['sizes'][size_key] = p[size_key]
+
+                # Save metadata JSON
+                details['_backup'] = {
+                    'downloaded_at': datetime.now().isoformat(),
+                    'file_path': str(photo_path) if download_photos else None,
+                }
+                meta_path.write_text(json.dumps(details, indent=2, ensure_ascii=False), encoding='utf-8')
+
+                # Download photo file
+                if download_photos:
+                    success, file_bytes = download_photo_file(photo_id, photo_path, verbose=False)
+                    if success:
+                        result['downloaded'] = 1
+                        result['bytes'] = file_bytes
                     else:
-                        print(f"[{i}/{len(photos_to_update)}] {photo_id} ({reason}):", end='', flush=True)
+                        result['errors'] = 1
+                else:
+                    result['updated'] = 1
 
-                    # Fetch detailed metadata
-                    details = fetch_photo_details(photo_id, verbose=not PROGRESS_MODE)
-
-                    # Add sizes from batch data
-                    details['sizes'] = {}
-                    for size_key in ['url_sq', 'url_q', 'url_t', 'url_s', 'url_m', 'url_z', 'url_l', 'url_o']:
-                        if p.get(size_key):
-                            details['sizes'][size_key] = p[size_key]
-
-                    # Save metadata JSON
-                    details['_backup'] = {
-                        'downloaded_at': datetime.now().isoformat(),
-                        'file_path': str(photo_path) if download_photos else None,
-                    }
-                    meta_path.write_text(json.dumps(details, indent=2, ensure_ascii=False), encoding='utf-8')
-
-                    # Download photo file
-                    if download_photos:
-                        success, file_bytes = download_photo_file(photo_id, photo_path, verbose=not PROGRESS_MODE)
-                        if success:
-                            stats['downloaded'] += 1
-                            if PROGRESS_MODE and file_bytes > 0:
-                                progress.add_bytes(file_bytes)
-                            if not PROGRESS_MODE:
-                                print(f" ✓")
-                        else:
-                            stats['errors'] += 1
-                            if not PROGRESS_MODE:
-                                print(f" ✗ (file)")
-                    else:
-                        stats['updated'] += 1
-                        if not PROGRESS_MODE:
-                            print(f" ✓ (meta)")
-
-                    # Update DB
+                # Update DB (thread-safe)
+                with db_lock:
                     cursor.execute('''
                         INSERT OR REPLACE INTO photos
                         (id, title, description, taken_date, upload_date, last_update,
@@ -1152,14 +1149,43 @@ def sync_backup(output_dir: Path, full: bool = False, download_photos: bool = Tr
                             VALUES (?, ?, ?, ?, ?)
                         ''', (photo_id, tag.get('id', ''), tag.get('raw', ''), tag.get('clean', ''), tag.get('author', '')))
 
-                    conn.commit()
+                return photo_id, reason, result, None
 
-                except Exception as e:
-                    if PROGRESS_MODE:
-                        progress.update(status=f"Error: {e}")
-                    else:
-                        print(f" ✗ Error: {e}")
-                    stats['errors'] += 1
+            except Exception as e:
+                result['errors'] = 1
+                return photo_id, reason, result, str(e)
+
+        try:
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                futures = {executor.submit(process_photo, task): task for task in photos_to_update}
+
+                for future in as_completed(futures):
+                    photo_id, reason, result, error = future.result()
+
+                    with stats_lock:
+                        stats['scanned'] += 1
+                        stats['downloaded'] += result['downloaded']
+                        stats['updated'] += result['updated']
+                        stats['errors'] += result['errors']
+                        completed_count[0] += 1
+
+                        if PROGRESS_MODE:
+                            progress.add_bytes(result['bytes'])
+                            status = f"{photo_id} ({reason})"
+                            if error:
+                                status = f"Error: {error[:20]}"
+                            progress.set(completed_count[0], status=status)
+                        else:
+                            if error:
+                                print(f"[{completed_count[0]}/{len(photos_to_update)}] {photo_id} ✗ {error}")
+                            else:
+                                print(f"[{completed_count[0]}/{len(photos_to_update)}] {photo_id} ✓")
+
+                        # Commit every 10 photos
+                        if completed_count[0] % 10 == 0:
+                            conn.commit()
+
+                conn.commit()  # Final commit
 
         except KeyboardInterrupt:
             interrupted = True
@@ -1167,7 +1193,7 @@ def sync_backup(output_dir: Path, full: bool = False, download_photos: bool = Tr
             print()
             print(f"\n⚠️  Interrupted! Progress saved.")
             print(f"   Downloaded: {stats['downloaded']}, Errors: {stats['errors']}")
-            print(f"   Remaining: {len(photos_to_update) - i} photos")
+            print(f"   Remaining: ~{len(photos_to_update) - completed_count[0]} photos")
             print(f"   Run 'sync' again to continue.")
 
         if PROGRESS_MODE and not interrupted:
@@ -2717,6 +2743,8 @@ def main():
                              help='Photo order: newest first (default) or oldest first')
     sync_parser.add_argument('--from-date', help='Start date (YYYY-MM-DD or YYYY)')
     sync_parser.add_argument('--to-date', help='End date (YYYY-MM-DD or YYYY)')
+    sync_parser.add_argument('-w', '--workers', type=int, default=8,
+                             help='Number of parallel download workers (default: 8)')
     # Output control (also available as global options before command)
     sync_parser.add_argument('-q', '--quiet', action='store_true', help='Quiet mode (errors only)')
     sync_parser.add_argument('-v', '--verbose', action='store_true', help='Verbose mode')
@@ -2909,6 +2937,7 @@ def main():
             output_dir=args.output,
             full=args.full,
             download_photos=not args.meta_only,
+            max_workers=args.workers,
             limit=args.limit,
             skip_albums=args.skip_albums,
             album_limit=args.album_limit,
