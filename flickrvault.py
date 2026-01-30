@@ -43,7 +43,10 @@ from flickr_api.api import flickr
 _rate_limit_lock = threading.Lock()
 _rate_limit_until = 0  # Unix timestamp when rate limit expires
 _rate_limit_consecutive = 0  # Track consecutive rate limits for exponential backoff
-_request_delay = 1.0   # Delay between requests (seconds) - Flickr limit: 3600/hour
+_request_delay = 0.2   # Dynamic delay - starts fast, adjusts based on rate limits
+_request_delay_min = 0.1  # Minimum delay (10 req/sec theoretical max)
+_request_delay_max = 2.0  # Maximum delay when hitting rate limits
+_success_count = 0  # Track consecutive successes for speed-up
 
 
 def check_rate_limit():
@@ -62,29 +65,41 @@ def check_rate_limit():
 
 
 def set_rate_limit(base_seconds=120):
-    """Set rate limit pause with exponential backoff for consecutive limits."""
-    global _rate_limit_until, _rate_limit_consecutive
+    """Set rate limit pause and slow down request rate."""
+    global _rate_limit_until, _rate_limit_consecutive, _request_delay, _success_count
     with _rate_limit_lock:
         _rate_limit_consecutive += 1
-        # Exponential backoff: 120s, 240s, 480s, 600s (max 10 min)
+        _success_count = 0  # Reset success counter
+        # Slow down: double the delay (up to max)
+        old_delay = _request_delay
+        _request_delay = min(_request_delay * 2, _request_delay_max)
+        # Exponential backoff for pause: 120s, 240s, 480s, 600s (max 10 min)
         wait_seconds = min(base_seconds * (2 ** (_rate_limit_consecutive - 1)), 600)
         new_until = time.time() + wait_seconds
         # Only extend if this is longer than current wait
         if new_until > _rate_limit_until:
             _rate_limit_until = new_until
             mins, secs = divmod(int(wait_seconds), 60)
+            delay_info = f" (delay: {old_delay:.1f}s → {_request_delay:.1f}s)"
             if mins > 0:
-                print(f"\n⚠️  Rate limit #{_rate_limit_consecutive}! Pausing {mins}m {secs}s...", flush=True)
+                print(f"\n⚠️  Rate limit #{_rate_limit_consecutive}! Pausing {mins}m {secs}s{delay_info}", flush=True)
             else:
-                print(f"\n⚠️  Rate limit #{_rate_limit_consecutive}! Pausing {secs}s...", flush=True)
+                print(f"\n⚠️  Rate limit #{_rate_limit_consecutive}! Pausing {secs}s{delay_info}", flush=True)
 
 
 def reset_rate_limit_backoff():
-    """Reset consecutive rate limit counter after successful request."""
-    global _rate_limit_consecutive
+    """Reset rate limit counter and potentially speed up after consecutive successes."""
+    global _rate_limit_consecutive, _request_delay, _success_count
     with _rate_limit_lock:
-        if _rate_limit_consecutive > 0:
-            _rate_limit_consecutive = 0
+        _rate_limit_consecutive = 0
+        _success_count += 1
+        # Speed up after 100 consecutive successes (reduce delay by 10%)
+        if _success_count >= 100 and _request_delay > _request_delay_min:
+            old_delay = _request_delay
+            _request_delay = max(_request_delay * 0.9, _request_delay_min)
+            _success_count = 0  # Reset counter
+            if os.environ.get('FLICKR_DEBUG'):
+                print(f"\n✨ 100 successes! Speed up: {old_delay:.2f}s → {_request_delay:.2f}s", flush=True)
 
 
 def is_rate_limit_error(error):
@@ -1059,10 +1074,12 @@ def sync_backup(output_dir: Path, full: bool = False, download_photos: bool = Tr
                 max_workers: int = 1, limit: int = None, skip_albums: bool = False,
                 album_limit: int = None, order: str = 'newest',
                 from_date: str = None, to_date: str = None,
-                request_delay: float = 1.0, wait_minutes: int = 0):
+                request_delay: float = 0, wait_minutes: int = 0):
     """Main sync function."""
     global _request_delay
-    _request_delay = request_delay
+    # If delay specified, use fixed delay; otherwise use dynamic (default 0.2s)
+    if request_delay > 0:
+        _request_delay = request_delay
 
     # Wait before starting if requested (for rate limit cooldown)
     if wait_minutes > 0:
@@ -2896,10 +2913,10 @@ def main():
                              help='Photo order: newest first (default) or oldest first')
     sync_parser.add_argument('--from-date', help='Start date (YYYY-MM-DD or YYYY)')
     sync_parser.add_argument('--to-date', help='End date (YYYY-MM-DD or YYYY)')
-    sync_parser.add_argument('-w', '--workers', type=int, default=1,
-                             help='Number of parallel download workers (default: 1)')
-    sync_parser.add_argument('--delay', type=float, default=1.0,
-                             help='Delay between API requests in seconds (default: 1.0)')
+    sync_parser.add_argument('-w', '--workers', type=int, default=4,
+                             help='Number of parallel download workers (default: 4)')
+    sync_parser.add_argument('--delay', type=float, default=0,
+                             help='Initial delay between API requests (default: dynamic 0.2s, auto-adjusts)')
     sync_parser.add_argument('--wait', type=int, default=0,
                              help='Wait N minutes before starting (for rate limit cooldown)')
     # Output control (also available as global options before command)
