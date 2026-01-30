@@ -999,10 +999,23 @@ def get_photo_year_month(photo_data: dict) -> tuple:
 
 
 def sync_backup(output_dir: Path, full: bool = False, download_photos: bool = True,
-                max_workers: int = 4, limit: int = None, skip_albums: bool = False,
+                max_workers: int = 2, limit: int = None, skip_albums: bool = False,
                 album_limit: int = None, order: str = 'newest',
-                from_date: str = None, to_date: str = None):
+                from_date: str = None, to_date: str = None,
+                request_delay: float = 0.5, wait_minutes: int = 0):
     """Main sync function."""
+    global _request_delay
+    _request_delay = request_delay
+
+    # Wait before starting if requested (for rate limit cooldown)
+    if wait_minutes > 0:
+        print(f"⏳ Waiting {wait_minutes} minutes before starting (rate limit cooldown)...")
+        for remaining in range(wait_minutes * 60, 0, -30):
+            mins, secs = divmod(remaining, 60)
+            print(f"   {mins}:{secs:02d} remaining...", flush=True)
+            time.sleep(min(30, remaining))
+        print("   Starting now!")
+
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     
@@ -2811,8 +2824,12 @@ def main():
                              help='Photo order: newest first (default) or oldest first')
     sync_parser.add_argument('--from-date', help='Start date (YYYY-MM-DD or YYYY)')
     sync_parser.add_argument('--to-date', help='End date (YYYY-MM-DD or YYYY)')
-    sync_parser.add_argument('-w', '--workers', type=int, default=4,
-                             help='Number of parallel download workers (default: 4)')
+    sync_parser.add_argument('-w', '--workers', type=int, default=2,
+                             help='Number of parallel download workers (default: 2)')
+    sync_parser.add_argument('--delay', type=float, default=0.5,
+                             help='Delay between API requests in seconds (default: 0.5)')
+    sync_parser.add_argument('--wait', type=int, default=0,
+                             help='Wait N minutes before starting (for rate limit cooldown)')
     # Output control (also available as global options before command)
     sync_parser.add_argument('-q', '--quiet', action='store_true', help='Quiet mode (errors only)')
     sync_parser.add_argument('-v', '--verbose', action='store_true', help='Verbose mode')
@@ -3011,7 +3028,9 @@ def main():
             album_limit=args.album_limit,
             order=args.order,
             from_date=args.from_date,
-            to_date=args.to_date
+            to_date=args.to_date,
+            request_delay=args.delay,
+            wait_minutes=args.wait
         )
     
     elif args.command == 'download':
