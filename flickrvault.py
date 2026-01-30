@@ -31,6 +31,7 @@ from urllib.parse import parse_qs, urlparse
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
+import random
 
 import flickr_api
 from flickr_api.api import flickr
@@ -95,8 +96,9 @@ def retry_on_error(func, max_retries=3, base_delay=2, exceptions=(Exception,)):
         try:
             # Check if we're rate limited before making request
             check_rate_limit()
-            # Small delay between requests to avoid rate limiting
-            time.sleep(_request_delay)
+            # Random delay between requests to avoid rate limiting (jitter helps)
+            jitter = random.uniform(0.5, 1.5)  # 50% to 150% of base delay
+            time.sleep(_request_delay * jitter)
             return func()
         except exceptions as e:
             last_error = e
@@ -999,10 +1001,10 @@ def get_photo_year_month(photo_data: dict) -> tuple:
 
 
 def sync_backup(output_dir: Path, full: bool = False, download_photos: bool = True,
-                max_workers: int = 2, limit: int = None, skip_albums: bool = False,
+                max_workers: int = 1, limit: int = None, skip_albums: bool = False,
                 album_limit: int = None, order: str = 'newest',
                 from_date: str = None, to_date: str = None,
-                request_delay: float = 0.5, wait_minutes: int = 0):
+                request_delay: float = 1.0, wait_minutes: int = 0):
     """Main sync function."""
     global _request_delay
     _request_delay = request_delay
@@ -2824,10 +2826,10 @@ def main():
                              help='Photo order: newest first (default) or oldest first')
     sync_parser.add_argument('--from-date', help='Start date (YYYY-MM-DD or YYYY)')
     sync_parser.add_argument('--to-date', help='End date (YYYY-MM-DD or YYYY)')
-    sync_parser.add_argument('-w', '--workers', type=int, default=2,
-                             help='Number of parallel download workers (default: 2)')
-    sync_parser.add_argument('--delay', type=float, default=0.5,
-                             help='Delay between API requests in seconds (default: 0.5)')
+    sync_parser.add_argument('-w', '--workers', type=int, default=1,
+                             help='Number of parallel download workers (default: 1)')
+    sync_parser.add_argument('--delay', type=float, default=1.0,
+                             help='Delay between API requests in seconds (default: 1.0)')
     sync_parser.add_argument('--wait', type=int, default=0,
                              help='Wait N minutes before starting (for rate limit cooldown)')
     # Output control (also available as global options before command)
