@@ -1102,7 +1102,9 @@ def sync_backup(output_dir: Path, full: bool = False, download_photos: bool = Tr
     username = user.username
 
     log_info(f"👤 User: {username} ({user_nsid})")
-    
+    delay_mode = "dynamic" if request_delay == 0 else f"fixed {request_delay}s"
+    log_info(f"⚙️  Workers: {max_workers}, Delay: {delay_mode} (current: {_request_delay:.1f}s)")
+
     # Save account info
     account_info = {
         'nsid': user_nsid,
