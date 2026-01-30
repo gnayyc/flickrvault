@@ -496,7 +496,8 @@ def get_user():
 
 def init_db(db_path: Path) -> sqlite3.Connection:
     """Initialize SQLite database."""
-    conn = sqlite3.connect(db_path)
+    # check_same_thread=False allows cross-thread access (we use db_lock for safety)
+    conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     
     conn.executescript('''
