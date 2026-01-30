@@ -470,6 +470,77 @@ def init_db(db_path: Path) -> sqlite3.Connection:
 
 # ============== SYNC ==============
 
+def fetch_recently_updated_photos(min_date: int, progress_callback=None, limit: int = None) -> list:
+    """Fetch photos updated since min_date (Unix timestamp).
+
+    Uses flickr.photos.recentlyUpdated API for efficient incremental sync.
+    """
+    all_photos = []
+    page = 1
+    per_page = 500 if not limit else min(500, limit)
+    total_pages = None
+
+    while True:
+        if progress_callback:
+            progress_callback(f"Fetching updates page {page}{'/' + str(total_pages) if total_pages else ''}...")
+        elif PROGRESS_MODE:
+            STATUS.update(phase='Phase 1', task='Fetching updates...',
+                         progress=f"page {page}{'/' + str(total_pages) if total_pages else ''}")
+
+        result = flickr_call(
+            flickr.photos.recentlyUpdated,
+            min_date=min_date,
+            extras=EXTRAS,
+            per_page=per_page,
+            page=page
+        )
+
+        photos = result['photos']['photo']
+        total_pages = int(result['photos']['pages'])
+        total = int(result['photos']['total'])
+
+        if not photos:
+            break
+
+        all_photos.extend(photos)
+
+        if progress_callback:
+            progress_callback(f"   Found {len(all_photos)}/{total} updated photos")
+
+        # Check limit
+        if limit and len(all_photos) >= limit:
+            all_photos = all_photos[:limit]
+            break
+
+        if page >= total_pages:
+            break
+        page += 1
+
+    return all_photos
+
+
+def get_last_sync_timestamp(conn) -> int:
+    """Get the most recent lastupdate timestamp from cached photos.
+
+    Returns Unix timestamp or 0 if no cached data.
+    """
+    cursor = conn.cursor()
+    row = cursor.execute('SELECT MAX(last_update) FROM photos WHERE last_update IS NOT NULL').fetchone()
+    if row and row[0]:
+        try:
+            return int(row[0])
+        except (ValueError, TypeError):
+            pass
+    return 0
+
+
+def get_cached_photo_count(conn) -> int:
+    """Get number of photos in cache."""
+    cursor = conn.cursor()
+    row = cursor.execute('SELECT COUNT(*) FROM photos').fetchone()
+    return row[0] if row else 0
+
+
 def fetch_all_photos_metadata(user_nsid: str, progress_callback=None, limit: int = None,
                                order: str = 'newest', from_date: str = None,
                                to_date: str = None) -> list:
@@ -863,24 +934,44 @@ def sync_backup(output_dir: Path, full: bool = False, download_photos: bool = Tr
     conn.commit()
     
     stats = {'scanned': 0, 'downloaded': 0, 'updated': 0, 'skipped': 0, 'errors': 0}
-    
-    # Phase 1: Fetch all photos metadata (batch, fast)
-    order_desc = "oldest first" if order == 'oldest' else "newest first"
-    date_range = ""
-    if from_date or to_date:
-        date_range = f" [{from_date or '...'} ~ {to_date or '...'}]"
-    log_info(f"\n📋 Phase 1: Fetching photo list ({order_desc}){date_range}...")
-    if PROGRESS_MODE:
-        STATUS.update(phase='Phase 1', task='Fetching photo list...', progress='')
-    all_photos = fetch_all_photos_metadata(
-        user_nsid,
-        progress_callback=log_info if not PROGRESS_MODE else None,
-        limit=limit,
-        order=order,
-        from_date=from_date,
-        to_date=to_date
-    )
-    log_info(f"   Total: {len(all_photos)} photos")
+
+    # Check for incremental sync
+    cached_count = get_cached_photo_count(conn)
+    last_sync_ts = get_last_sync_timestamp(conn)
+    use_incremental = not full and cached_count > 0 and last_sync_ts > 0 and not from_date and not to_date
+
+    # Phase 1: Fetch photos metadata
+    if use_incremental:
+        # Incremental: only fetch recently updated photos
+        last_sync_time = datetime.fromtimestamp(last_sync_ts).strftime('%Y-%m-%d %H:%M:%S')
+        log_info(f"\n📋 Phase 1: Fetching updates since {last_sync_time}...")
+        log_info(f"   (Cached: {cached_count} photos, use --full to re-fetch all)")
+        if PROGRESS_MODE:
+            STATUS.update(phase='Phase 1', task='Fetching updates...', progress='')
+        all_photos = fetch_recently_updated_photos(
+            min_date=last_sync_ts,
+            progress_callback=log_info if not PROGRESS_MODE else None,
+            limit=limit
+        )
+        log_info(f"   Found: {len(all_photos)} updated photos")
+    else:
+        # Full fetch
+        order_desc = "oldest first" if order == 'oldest' else "newest first"
+        date_range = ""
+        if from_date or to_date:
+            date_range = f" [{from_date or '...'} ~ {to_date or '...'}]"
+        log_info(f"\n📋 Phase 1: Fetching photo list ({order_desc}){date_range}...")
+        if PROGRESS_MODE:
+            STATUS.update(phase='Phase 1', task='Fetching photo list...', progress='')
+        all_photos = fetch_all_photos_metadata(
+            user_nsid,
+            progress_callback=log_info if not PROGRESS_MODE else None,
+            limit=limit,
+            order=order,
+            from_date=from_date,
+            to_date=to_date
+        )
+        log_info(f"   Total: {len(all_photos)} photos")
     
     # Phase 2: Determine what needs update
     log_info("\n🔍 Phase 2: Checking for updates...")
