@@ -42,6 +42,7 @@ from flickr_api.api import flickr
 # Global rate limit state (shared across threads)
 _rate_limit_lock = threading.Lock()
 _rate_limit_until = 0  # Unix timestamp when rate limit expires
+_rate_limit_consecutive = 0  # Track consecutive rate limits for exponential backoff
 _request_delay = 0.1   # Delay between requests (seconds)
 
 
@@ -52,19 +53,38 @@ def check_rate_limit():
         now = time.time()
         if _rate_limit_until > now:
             wait_time = _rate_limit_until - now
-            print(f"\n⏳ Rate limited, waiting {wait_time:.0f}s...", flush=True)
+            mins, secs = divmod(int(wait_time), 60)
+            if mins > 0:
+                print(f"\n⏳ Rate limited, waiting {mins}m {secs}s...", flush=True)
+            else:
+                print(f"\n⏳ Rate limited, waiting {secs}s...", flush=True)
             time.sleep(wait_time)
 
 
-def set_rate_limit(seconds=120):
-    """Set rate limit pause for all threads."""
-    global _rate_limit_until
+def set_rate_limit(base_seconds=120):
+    """Set rate limit pause with exponential backoff for consecutive limits."""
+    global _rate_limit_until, _rate_limit_consecutive
     with _rate_limit_lock:
-        new_until = time.time() + seconds
+        _rate_limit_consecutive += 1
+        # Exponential backoff: 120s, 240s, 480s, 600s (max 10 min)
+        wait_seconds = min(base_seconds * (2 ** (_rate_limit_consecutive - 1)), 600)
+        new_until = time.time() + wait_seconds
         # Only extend if this is longer than current wait
         if new_until > _rate_limit_until:
             _rate_limit_until = new_until
-            print(f"\n⚠️  Rate limit detected! Pausing {seconds}s...", flush=True)
+            mins, secs = divmod(int(wait_seconds), 60)
+            if mins > 0:
+                print(f"\n⚠️  Rate limit #{_rate_limit_consecutive}! Pausing {mins}m {secs}s...", flush=True)
+            else:
+                print(f"\n⚠️  Rate limit #{_rate_limit_consecutive}! Pausing {secs}s...", flush=True)
+
+
+def reset_rate_limit_backoff():
+    """Reset consecutive rate limit counter after successful request."""
+    global _rate_limit_consecutive
+    with _rate_limit_lock:
+        if _rate_limit_consecutive > 0:
+            _rate_limit_consecutive = 0
 
 
 def is_rate_limit_error(error):
@@ -90,7 +110,7 @@ def retry_on_error(func, max_retries=3, base_delay=2, exceptions=(Exception,)):
     """
     last_error = None
     rate_limit_retries = 0
-    max_rate_limit_retries = 5  # Extra retries for rate limit
+    max_rate_limit_retries = 10  # More retries since we use exponential backoff
 
     for attempt in range(max_retries + 1 + max_rate_limit_retries):
         try:
@@ -99,14 +119,17 @@ def retry_on_error(func, max_retries=3, base_delay=2, exceptions=(Exception,)):
             # Random delay between requests to avoid rate limiting (jitter helps)
             jitter = random.uniform(0.5, 1.5)  # 50% to 150% of base delay
             time.sleep(_request_delay * jitter)
-            return func()
+            result = func()
+            # Success - reset consecutive rate limit counter
+            reset_rate_limit_backoff()
+            return result
         except exceptions as e:
             last_error = e
             # Check for rate limit error
             if is_rate_limit_error(e):
                 rate_limit_retries += 1
                 if rate_limit_retries <= max_rate_limit_retries:
-                    set_rate_limit(120)  # Wait 120 seconds on rate limit
+                    set_rate_limit()  # Auto-calculate wait with exponential backoff
                     check_rate_limit()  # Actually wait
                     continue  # Retry after rate limit wait
                 else:
