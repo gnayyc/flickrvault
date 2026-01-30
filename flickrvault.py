@@ -38,6 +38,37 @@ from flickr_api.api import flickr
 
 # ============== RETRY HELPER ==============
 
+# Global rate limit state (shared across threads)
+_rate_limit_lock = threading.Lock()
+_rate_limit_until = 0  # Unix timestamp when rate limit expires
+_request_delay = 0.1   # Delay between requests (seconds)
+
+
+def check_rate_limit():
+    """Check if we're currently rate limited, wait if needed."""
+    global _rate_limit_until
+    with _rate_limit_lock:
+        now = time.time()
+        if _rate_limit_until > now:
+            wait_time = _rate_limit_until - now
+            print(f"\n⏳ Rate limited, waiting {wait_time:.0f}s...", flush=True)
+            time.sleep(wait_time)
+
+
+def set_rate_limit(seconds=60):
+    """Set rate limit pause for all threads."""
+    global _rate_limit_until
+    with _rate_limit_lock:
+        _rate_limit_until = time.time() + seconds
+        print(f"\n⚠️  Rate limit detected! Pausing {seconds}s...", flush=True)
+
+
+def is_rate_limit_error(error):
+    """Check if error is a 429 rate limit."""
+    error_str = str(error)
+    return '429' in error_str or 'Too Many Requests' in error_str
+
+
 def retry_on_error(func, max_retries=3, base_delay=2, exceptions=(Exception,)):
     """Retry a function with exponential backoff.
 
@@ -56,10 +87,19 @@ def retry_on_error(func, max_retries=3, base_delay=2, exceptions=(Exception,)):
     last_error = None
     for attempt in range(max_retries + 1):
         try:
+            # Check if we're rate limited before making request
+            check_rate_limit()
+            # Small delay between requests to avoid rate limiting
+            time.sleep(_request_delay)
             return func()
         except exceptions as e:
             last_error = e
-            if attempt < max_retries:
+            # Check for rate limit error
+            if is_rate_limit_error(e):
+                set_rate_limit(60)  # Wait 60 seconds on rate limit
+                if attempt < max_retries:
+                    continue  # Retry after rate limit wait
+            elif attempt < max_retries:
                 delay = base_delay * (2 ** attempt)
                 error_type = type(e).__name__
                 log_debug(f"    ⚠️  {error_type}, retrying in {delay}s... ({attempt + 1}/{max_retries})")
@@ -931,7 +971,7 @@ def get_photo_year_month(photo_data: dict) -> tuple:
 
 
 def sync_backup(output_dir: Path, full: bool = False, download_photos: bool = True,
-                max_workers: int = 8, limit: int = None, skip_albums: bool = False,
+                max_workers: int = 4, limit: int = None, skip_albums: bool = False,
                 album_limit: int = None, order: str = 'newest',
                 from_date: str = None, to_date: str = None):
     """Main sync function."""
@@ -2743,8 +2783,8 @@ def main():
                              help='Photo order: newest first (default) or oldest first')
     sync_parser.add_argument('--from-date', help='Start date (YYYY-MM-DD or YYYY)')
     sync_parser.add_argument('--to-date', help='End date (YYYY-MM-DD or YYYY)')
-    sync_parser.add_argument('-w', '--workers', type=int, default=8,
-                             help='Number of parallel download workers (default: 8)')
+    sync_parser.add_argument('-w', '--workers', type=int, default=4,
+                             help='Number of parallel download workers (default: 4)')
     # Output control (also available as global options before command)
     sync_parser.add_argument('-q', '--quiet', action='store_true', help='Quiet mode (errors only)')
     sync_parser.add_argument('-v', '--verbose', action='store_true', help='Verbose mode')
