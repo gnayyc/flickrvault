@@ -511,7 +511,7 @@ def fetch_recently_updated_photos(min_date: int, progress_callback=None, limit: 
         if progress_callback:
             progress_callback(f"Fetching updates page {page}{'/' + str(total_pages) if total_pages else ''}...")
         elif PROGRESS_MODE:
-            STATUS.update(phase='Phase 1', task='Fetching updates...',
+            STATUS.update(phase='[1/4] API', task='Fetching recently updated...',
                          progress=f"page {page}{'/' + str(total_pages) if total_pages else ''}")
 
         result = flickr_call(
@@ -602,7 +602,7 @@ def fetch_all_photos_metadata(user_nsid: str, progress_callback=None, limit: int
         if progress_callback:
             progress_callback(f"Fetching page {page}{'/' + str(total_pages) if total_pages else ''}...")
         elif PROGRESS_MODE:
-            STATUS.update(phase='Phase 1', task='Fetching photo list...',
+            STATUS.update(phase='[1/4] API', task='Fetching all photos...',
                          progress=f"page {page}{'/' + str(total_pages) if total_pages else ''}")
 
         if use_search:
@@ -681,7 +681,7 @@ def fetch_all_albums(user, progress_callback=None) -> list:
         if progress_callback:
             progress_callback(f"  [{i}/{total}] Fetching album info...")
         elif PROGRESS_MODE:
-            STATUS.update(phase='Phase 4', task='Fetching albums...', progress=f"{i}/{total}")
+            STATUS.update(phase='[4/4] Albums', task='Fetching album metadata...', progress=f"{i}/{total}")
         try:
             info = retry_on_error(lambda ps=ps: ps.getInfo())
             albums.append({
@@ -973,6 +973,16 @@ def sync_backup(output_dir: Path, full: bool = False, download_photos: bool = Tr
     last_sync_ts = get_last_sync_timestamp(conn)
     use_incremental = not full and cached_count > 0 and last_sync_ts > 0 and not from_date and not to_date
 
+    # Print sync mode banner
+    if PROGRESS_MODE:
+        if use_incremental:
+            last_sync_time = datetime.fromtimestamp(last_sync_ts).strftime('%Y-%m-%d %H:%M')
+            print(f"🔄 Incremental sync (cache: {cached_count} photos, last: {last_sync_time})")
+        else:
+            mode = "full" if full else "initial"
+            print(f"📥 Full sync ({mode})")
+        print()
+
     # Phase 1: Fetch photos metadata
     if use_incremental:
         # Incremental: only fetch recently updated photos
@@ -980,7 +990,7 @@ def sync_backup(output_dir: Path, full: bool = False, download_photos: bool = Tr
         log_info(f"\n📋 Phase 1: Fetching updates since {last_sync_time}...")
         log_info(f"   (Cached: {cached_count} photos, use --full to re-fetch all)")
         if PROGRESS_MODE:
-            STATUS.update(phase='Phase 1', task='Fetching updates...', progress='')
+            STATUS.update(phase='[1/4] API', task='Fetching recently updated photos...', progress='')
         all_photos = fetch_recently_updated_photos(
             min_date=last_sync_ts,
             progress_callback=log_info if not PROGRESS_MODE else None,
@@ -995,7 +1005,7 @@ def sync_backup(output_dir: Path, full: bool = False, download_photos: bool = Tr
             date_range = f" [{from_date or '...'} ~ {to_date or '...'}]"
         log_info(f"\n📋 Phase 1: Fetching photo list ({order_desc}){date_range}...")
         if PROGRESS_MODE:
-            STATUS.update(phase='Phase 1', task='Fetching photo list...', progress='')
+            STATUS.update(phase='[1/4] API', task='Fetching all photos from Flickr...', progress='')
         all_photos = fetch_all_photos_metadata(
             user_nsid,
             progress_callback=log_info if not PROGRESS_MODE else None,
@@ -1005,17 +1015,17 @@ def sync_backup(output_dir: Path, full: bool = False, download_photos: bool = Tr
             to_date=to_date
         )
         log_info(f"   Total: {len(all_photos)} photos")
-    
+
     # Phase 2: Determine what needs update
     log_info("\n🔍 Phase 2: Checking for updates...")
     if PROGRESS_MODE:
-        STATUS.update(phase='Phase 2', task='Checking for updates...', progress='')
+        STATUS.update(phase='[2/4] Compare', task='Comparing with local cache...', progress='')
     photos_to_update = []
     total_photos = len(all_photos)
 
     for i, p in enumerate(all_photos):
         if PROGRESS_MODE and (i % 100 == 0 or i == total_photos - 1):
-            STATUS.update(phase='Phase 2', task='Checking for updates...',
+            STATUS.update(phase='[2/4] Compare', task='Comparing with local cache...',
                          progress=f"{i + 1}/{total_photos}")
         photo_id = p['id']
         flickr_updated = p.get('lastupdate', '0')
@@ -1052,7 +1062,8 @@ def sync_backup(output_dir: Path, full: bool = False, download_photos: bool = Tr
 
         # Progress bar for Phase 3
         if PROGRESS_MODE:
-            progress = ProgressBar(len(photos_to_update), desc='Phase 3')
+            desc = '[3/4] Download' if download_photos else '[3/4] Metadata'
+            progress = ProgressBar(len(photos_to_update), desc=desc)
 
         for i, (p, reason) in enumerate(photos_to_update, 1):
             photo_id = p['id']
@@ -1159,6 +1170,8 @@ def sync_backup(output_dir: Path, full: bool = False, download_photos: bool = Tr
         albums = []
     else:
         log_info("\n📁 Phase 4: Syncing albums...")
+        if PROGRESS_MODE:
+            STATUS.update(phase='[4/4] Albums', task='Fetching album list from Flickr...', progress='')
         albums = fetch_all_albums(user, progress_callback=log_info if not PROGRESS_MODE else None)
         log_info(f"   Found {len(albums)} albums")
         if album_limit:
@@ -1172,7 +1185,7 @@ def sync_backup(output_dir: Path, full: bool = False, download_photos: bool = Tr
 
     # Progress bar for Phase 4
     if PROGRESS_MODE and albums:
-        album_progress = ProgressBar(len(albums), desc='Phase 4')
+        album_progress = ProgressBar(len(albums), desc='[4/4] Albums')
 
     for i, album in enumerate(albums, 1):
         if PROGRESS_MODE:
