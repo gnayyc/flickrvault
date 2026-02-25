@@ -709,6 +709,54 @@ def get_flickr_photo_count(user_nsid: str) -> int:
     return int(result['photos']['total'])
 
 
+def get_all_flickr_photo_ids(user_nsid: str, progress_callback=None) -> set:
+    """Fetch all photo IDs from Flickr (lightweight, no extras).
+
+    Returns a set of photo ID strings for fast comparison.
+    """
+    all_ids = set()
+    page = 1
+    per_page = 500
+    total_pages = None
+
+    while True:
+        if progress_callback:
+            progress_callback(f"   Fetching IDs page {page}{'/' + str(total_pages) if total_pages else ''}...")
+        elif PROGRESS_MODE:
+            STATUS.update(phase='Verify', task='Fetching photo IDs from Flickr...',
+                         progress=f"page {page}{'/' + str(total_pages) if total_pages else ''}")
+
+        result = flickr_call(
+            flickr.people.getPhotos,
+            user_id=user_nsid,
+            per_page=per_page,
+            page=page,
+            extras=''  # No extras - just IDs
+        )
+
+        photos = result['photos']['photo']
+        total_pages = int(result['photos']['pages'])
+
+        if not photos:
+            break
+
+        for p in photos:
+            all_ids.add(str(p['id']))
+
+        if page >= total_pages:
+            break
+        page += 1
+
+    return all_ids
+
+
+def get_local_photo_ids(conn) -> set:
+    """Get all photo IDs from local database."""
+    cursor = conn.cursor()
+    rows = cursor.execute('SELECT photo_id FROM photos').fetchall()
+    return {str(row[0]) for row in rows}
+
+
 def fetch_all_photos_metadata(user_nsid: str, progress_callback=None, limit: int = None,
                                order: str = 'newest', from_date: str = None,
                                to_date: str = None) -> list:
@@ -1074,7 +1122,8 @@ def sync_backup(output_dir: Path, full: bool = False, download_photos: bool = Tr
                 max_workers: int = 1, limit: int = None, skip_albums: bool = False,
                 album_limit: int = None, order: str = 'newest',
                 from_date: str = None, to_date: str = None,
-                request_delay: float = 0, wait_minutes: int = 0):
+                request_delay: float = 0, wait_minutes: int = 0,
+                verify: bool = False, verify_only: bool = False):
     """Main sync function."""
     global _request_delay
     # If delay specified, use fixed delay; otherwise use dynamic (default 0.2s)
@@ -1125,7 +1174,7 @@ def sync_backup(output_dir: Path, full: bool = False, download_photos: bool = Tr
     # Auto-detect incomplete sync by comparing local count vs Flickr total
     flickr_total = 0
     auto_full = False
-    if not full and cached_count > 0 and last_sync_ts > 0 and not from_date and not to_date:
+    if not full and not verify_only and cached_count > 0 and last_sync_ts > 0 and not from_date and not to_date:
         log_info("🔍 Checking Flickr photo count...")
         flickr_total = get_flickr_photo_count(user_nsid)
         if cached_count < flickr_total:
@@ -1133,11 +1182,60 @@ def sync_backup(output_dir: Path, full: bool = False, download_photos: bool = Tr
             log_info(f"   ⚠️  Incomplete sync detected: {cached_count} local < {flickr_total} on Flickr")
             log_info(f"   → Switching to full mode to catch missing photos")
 
+    # Verify mode: ID-based comparison
+    verify_missing = set()
+    verify_extra = set()
+    if (verify or verify_only) and cached_count == 0:
+        log_info("🔎 Verify: Skipped (no local photos yet, run a full sync first)")
+    elif (verify or verify_only) and cached_count > 0:
+        log_info("🔎 Verify: Fetching all photo IDs from Flickr...")
+        flickr_ids = get_all_flickr_photo_ids(user_nsid, progress_callback=log_info if not PROGRESS_MODE else None)
+        local_ids = get_local_photo_ids(conn)
+
+        verify_missing = flickr_ids - local_ids   # On Flickr but not local
+        verify_extra = local_ids - flickr_ids      # Local but not on Flickr
+
+        log_info(f"   Flickr: {len(flickr_ids)} photos, Local: {len(local_ids)} photos")
+        if verify_missing:
+            log_info(f"   ⚠️  Missing locally: {len(verify_missing)} photos")
+        if verify_extra:
+            log_info(f"   ℹ️  Extra locally (deleted on Flickr?): {len(verify_extra)} photos")
+        if not verify_missing and not verify_extra:
+            log_info(f"   ✅ All IDs match! Local backup is complete.")
+
+        if PROGRESS_MODE:
+            print(f"🔎 Verify: Flickr={len(flickr_ids)}, Local={len(local_ids)}, "
+                  f"Missing={len(verify_missing)}, Extra={len(verify_extra)}")
+
+        if verify_only:
+            # Report only, no sync
+            if verify_missing:
+                print(f"\nMissing photo IDs (first 20):")
+                for pid in sorted(verify_missing)[:20]:
+                    print(f"  {pid}")
+                if len(verify_missing) > 20:
+                    print(f"  ... and {len(verify_missing) - 20} more")
+            if verify_extra:
+                print(f"\nExtra local photo IDs (first 20):")
+                for pid in sorted(verify_extra)[:20]:
+                    print(f"  {pid}")
+                if len(verify_extra) > 20:
+                    print(f"  ... and {len(verify_extra) - 20} more")
+            conn.close()
+            return
+
+        # If mismatches found, switch to full sync
+        if verify_missing:
+            auto_full = True
+            log_info(f"   → Switching to full mode to sync {len(verify_missing)} missing photos")
+
     use_incremental = not full and not auto_full and cached_count > 0 and last_sync_ts > 0 and not from_date and not to_date
 
     # Start sync log (after auto-detection)
     sync_started = datetime.now().isoformat()
-    sync_type = 'incremental' if use_incremental else ('auto-full' if auto_full else 'full')
+    sync_type = 'verify-full' if (verify and verify_missing) else (
+        'incremental' if use_incremental else ('auto-full' if auto_full else 'full')
+    )
     cursor.execute('''
         INSERT INTO sync_log (sync_type, started_at, photos_scanned, photos_downloaded, photos_updated, errors)
         VALUES (?, ?, 0, 0, 0, 0)
@@ -2908,6 +3006,10 @@ def main():
     sync_parser.add_argument('-o', '--output', type=Path, default=Path('./flickr_backup'),
                              help='Output directory (default: ./flickr_backup)')
     sync_parser.add_argument('--full', action='store_true', help='Full sync (re-download all metadata)')
+    sync_parser.add_argument('--verify', action='store_true',
+                             help='Verify local IDs against Flickr, then sync any missing')
+    sync_parser.add_argument('--verify-only', action='store_true',
+                             help='Verify local IDs against Flickr (report only, no sync)')
     sync_parser.add_argument('--meta-only', action='store_true', help='Only sync metadata, skip photo files')
     sync_parser.add_argument('-n', '--limit', type=int, help='Limit number of photos (for testing)')
     sync_parser.add_argument('--skip-albums', action='store_true', help='Skip album sync (Phase 4)')
@@ -3122,7 +3224,9 @@ def main():
             from_date=args.from_date,
             to_date=args.to_date,
             request_delay=args.delay,
-            wait_minutes=args.wait
+            wait_minutes=args.wait,
+            verify=args.verify,
+            verify_only=args.verify_only
         )
     
     elif args.command == 'download':
